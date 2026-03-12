@@ -11,6 +11,7 @@ import (
 
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/launcher"
+	"github.com/go-rod/rod/lib/proto"
 )
 
 var activeRodSessions atomic.Int32
@@ -53,6 +54,15 @@ func (rb *RodBrowser) OpenUpdatePrimaryLocation(link, netflixEmail, netflixPassw
 	logging.Log.WithField("trace_id", traceID).Warn("All attempts failed, giving up on link")
 	return models.ResultFailed, nil
 }
+
+type pageOutcome int
+
+const (
+	outcomeUnknown   pageOutcome = iota
+	outcomeLogin
+	outcomeConfirmed
+	outcomeExpired
+)
 
 // attemptOpenLink performs a single attempt to open the link and interact with the page.
 func (rb *RodBrowser) attemptOpenLink(
@@ -107,55 +117,93 @@ func (rb *RodBrowser) attemptOpenLink(
 
 	page.MustWaitLoad()
 
-	// Try to accept cookie banner if present
-	if cookieBtn, err := page.Timeout(5 * time.Second).Element("#onetrust-accept-btn-handler"); err == nil {
+	// Accept cookie banner if present
+	if cookieBtn, err := page.Timeout(3 * time.Second).Element("#onetrust-accept-btn-handler"); err == nil {
 		locallog.Info("Cookie banner detected, accepting")
 		cookieBtn.MustClick()
 	}
 
-	// Detect login form
-	loginElement, err := page.Timeout(10 * time.Second).
-		Element(`input[name='userLoginId']`)
-	if err == nil {
-		if netflixEmail != "" && netflixPassword != "" {
-			locallog.Info("Login fields detected, attempting to log in")
-			loginElement.MustInput(netflixEmail)
-			page.MustElement(`input[name='password']`).MustInput(netflixPassword)
-			page.MustElement(`[data-uia="login-submit-button"]`).MustClick()
-			page.MustWaitLoad()
+	outcome, capturedLoginEl, err := racePageElements(page, 15*time.Second)
+	if err != nil {
+		locallog.WithError(err).Warnf("Attempt %d: page race failed", attempt)
+		return models.ResultFailed, err
+	}
 
-			// Cookie banner can reappear after login
-			if cookieBtn, err := page.Timeout(5 * time.Second).Element("#onetrust-accept-btn-handler"); err == nil {
-				locallog.Info("Cookie banner detected after login, accepting")
-				cookieBtn.MustClick()
-			}
-		} else {
+	switch outcome {
+	case outcomeConfirmed:
+		locallog.Info("Clicked on confirm button successfully")
+		return models.ResultSuccess, nil
+
+	case outcomeExpired:
+		locallog.Info("Expired link detected (upl-invalid-token present)")
+		return models.ResultExpired, nil
+
+	case outcomeLogin:
+		if netflixEmail == "" || netflixPassword == "" {
 			locallog.Info("Login required but credentials unavailable, aborting link")
 			return models.ResultAbort, nil
 		}
+		locallog.Info("Login fields detected, attempting to log in")
+		capturedLoginEl.MustInput(netflixEmail)
+		page.MustElement(`input[name='password']`).MustInput(netflixPassword)
+		page.MustElement(`[data-uia="login-submit-button"]`).MustClick()
+		page.MustWaitLoad()
+
+		// Cookie banner can reappear after login
+		if cookieBtn, err := page.Timeout(3 * time.Second).Element("#onetrust-accept-btn-handler"); err == nil {
+			locallog.Info("Cookie banner detected after login, accepting")
+			cookieBtn.MustClick()
+		}
+
+		// After login, race between confirm button and expired token
+		postOutcome, _, err := racePageElements(page, 15*time.Second)
+		if err != nil {
+			locallog.WithError(err).Warnf("Attempt %d: post-login page race failed", attempt)
+			return models.ResultFailed, err
+		}
+		switch postOutcome {
+		case outcomeConfirmed:
+			locallog.Info("Clicked on confirm button successfully")
+			return models.ResultSuccess, nil
+		case outcomeExpired:
+			locallog.Info("Expired link detected after login")
+			return models.ResultExpired, nil
+		default:
+			locallog.Warnf("Attempt %d: unexpected state after login", attempt)
+			return models.ResultFailed, nil
+		}
 	}
 
-	// Try to find the confirm button: if it exists, the link is valid
-	confirmBtn, err := page.Timeout(10 * time.Second).
-		Element(`[data-uia="set-primary-location-action"]`)
-	if err == nil {
-		confirmBtn.MustClick()
-		locallog.Info("Clicked on confirm button successfully")
-		return models.ResultSuccess, nil
-	}
-
-	locallog.Warnf("Attempt %d: confirm button not found, checking for expired link message", attempt)
-
-	// If confirm button is not found, check for the "invalid / expired" container
-	_, err = page.Timeout(5 * time.Second).
-		Element(`[data-uia="upl-invalid-token"]`)
-	if err == nil {
-		locallog.Info("Expired link detected (upl-invalid-token present)")
-		return models.ResultExpired, nil
-	}
-
-	locallog.Warnf("Attempt %d: confirm button not found and no expired message detected", attempt)
+	locallog.Warnf("Attempt %d: timed out waiting for page elements", attempt)
 	return models.ResultFailed, nil
+}
+
+// racePageElements races between login form, confirm button, and expired-token element.
+// Returns the outcome and, for outcomeLogin, the captured login input element.
+func racePageElements(page *rod.Page, timeout time.Duration) (pageOutcome, *rod.Element, error) {
+	outcome := outcomeUnknown
+	var capturedLoginEl *rod.Element
+
+	_, err := page.Timeout(timeout).Race().
+		Element(`input[name='userLoginId']`).Handle(func(e *rod.Element) error {
+			outcome = outcomeLogin
+			capturedLoginEl = e
+			return nil
+		}).
+		Element(`[data-uia="set-primary-location-action"]`).Handle(func(e *rod.Element) error {
+			if err := e.Click(proto.InputMouseButtonLeft, 1); err != nil {
+				return err
+			}
+			outcome = outcomeConfirmed
+			return nil
+		}).
+		Element(`[data-uia="upl-invalid-token"]`).Handle(func(e *rod.Element) error {
+			outcome = outcomeExpired
+			return nil
+		}).
+		Do()
+
+	return outcome, capturedLoginEl, err
 }
 
 // StartCleanup starts a background goroutine that cleans up old Rod temp directories
