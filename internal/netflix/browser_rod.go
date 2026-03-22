@@ -1,6 +1,7 @@
 package netflix
 
 import (
+	"net/url"
 	"netflix-household-validator/internal/models"
 	"os"
 	"path/filepath"
@@ -24,15 +25,16 @@ func NewRodBrowser() *RodBrowser {
 }
 
 // OpenUpdatePrimaryLocation attempts to open the provided link using Rod, handling login if necessary.
-func (rb *RodBrowser) OpenUpdatePrimaryLocation(link, netflixEmail, netflixPassword string, traceID string) (models.BrowserResult, error) {
+func (rb *RodBrowser) OpenUpdatePrimaryLocation(link, traceID string) (models.BrowserResult, error) {
 	const maxAttempts = 3
 
-	logging.Log.WithField("trace_id", traceID).Info("Open page with rod: ", link)
+	sanitizedLink := sanitizeURL(link)
+	logging.Log.WithField("trace_id", traceID).Info("Open page with rod: ", sanitizedLink)
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		logging.Log.WithField("trace_id", traceID).Infof("Attempt %d/%d (fresh browser & profile)", attempt, maxAttempts)
 
-		result, err := rb.attemptOpenLink(link, netflixEmail, netflixPassword, attempt, traceID)
+		result, err := rb.attemptOpenLink(link, attempt, traceID)
 		if err != nil {
 			logging.Log.WithField("trace_id", traceID).WithError(err).Warnf("Attempt %d error", attempt)
 		}
@@ -59,7 +61,6 @@ type pageOutcome int
 
 const (
 	outcomeUnknown   pageOutcome = iota
-	outcomeLogin
 	outcomeConfirmed
 	outcomeExpired
 )
@@ -67,8 +68,6 @@ const (
 // attemptOpenLink performs a single attempt to open the link and interact with the page.
 func (rb *RodBrowser) attemptOpenLink(
 	link string,
-	netflixEmail string,
-	netflixPassword string,
 	attempt int,
 	traceID string,
 ) (models.BrowserResult, error) {
@@ -123,7 +122,7 @@ func (rb *RodBrowser) attemptOpenLink(
 		cookieBtn.MustClick()
 	}
 
-	outcome, capturedLoginEl, err := racePageElements(page, 15*time.Second)
+	outcome, err := racePageElements(page, 15*time.Second)
 	if err != nil {
 		locallog.WithError(err).Warnf("Attempt %d: page race failed", attempt)
 		return models.ResultFailed, err
@@ -137,59 +136,18 @@ func (rb *RodBrowser) attemptOpenLink(
 	case outcomeExpired:
 		locallog.Info("Expired link detected (upl-invalid-token present)")
 		return models.ResultExpired, nil
-
-	case outcomeLogin:
-		if netflixEmail == "" || netflixPassword == "" {
-			locallog.Info("Login required but credentials unavailable, aborting link")
-			return models.ResultAbort, nil
-		}
-		locallog.Info("Login fields detected, attempting to log in")
-		capturedLoginEl.MustInput(netflixEmail)
-		page.MustElement(`input[name='password']`).MustInput(netflixPassword)
-		page.MustElement(`[data-uia="login-submit-button"]`).MustClick()
-		page.MustWaitLoad()
-
-		// Cookie banner can reappear after login
-		if cookieBtn, err := page.Timeout(3 * time.Second).Element("#onetrust-accept-btn-handler"); err == nil {
-			locallog.Info("Cookie banner detected after login, accepting")
-			cookieBtn.MustClick()
-		}
-
-		// After login, race between confirm button and expired token
-		postOutcome, _, err := racePageElements(page, 15*time.Second)
-		if err != nil {
-			locallog.WithError(err).Warnf("Attempt %d: post-login page race failed", attempt)
-			return models.ResultFailed, err
-		}
-		switch postOutcome {
-		case outcomeConfirmed:
-			locallog.Info("Clicked on confirm button successfully")
-			return models.ResultSuccess, nil
-		case outcomeExpired:
-			locallog.Info("Expired link detected after login")
-			return models.ResultExpired, nil
-		default:
-			locallog.Warnf("Attempt %d: unexpected state after login", attempt)
-			return models.ResultFailed, nil
-		}
 	}
 
 	locallog.Warnf("Attempt %d: timed out waiting for page elements", attempt)
 	return models.ResultFailed, nil
 }
 
-// racePageElements races between login form, confirm button, and expired-token element.
-// Returns the outcome and, for outcomeLogin, the captured login input element.
-func racePageElements(page *rod.Page, timeout time.Duration) (pageOutcome, *rod.Element, error) {
+// racePageElements races between confirm button and expired-token element.
+// Returns the outcome.
+func racePageElements(page *rod.Page, timeout time.Duration) (pageOutcome, error) {
 	outcome := outcomeUnknown
-	var capturedLoginEl *rod.Element
 
 	_, err := page.Timeout(timeout).Race().
-		Element(`input[name='userLoginId']`).Handle(func(e *rod.Element) error {
-			outcome = outcomeLogin
-			capturedLoginEl = e
-			return nil
-		}).
 		Element(`[data-uia="set-primary-location-action"]`).Handle(func(e *rod.Element) error {
 			if err := e.Click(proto.InputMouseButtonLeft, 1); err != nil {
 				return err
@@ -203,7 +161,7 @@ func racePageElements(page *rod.Page, timeout time.Duration) (pageOutcome, *rod.
 		}).
 		Do()
 
-	return outcome, capturedLoginEl, err
+	return outcome, err
 }
 
 // StartCleanup starts a background goroutine that cleans up old Rod temp directories
@@ -234,4 +192,30 @@ func StartCleanup() {
 			}
 		}
 	}()
+}
+
+// sanitizeURL redacts sensitive query parameters from the URL for safe logging
+func sanitizeURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+
+	q := u.Query()
+
+	redactKeys := map[string]struct{}{
+		"nftoken": {},
+		"g":       {},
+	}
+
+	for key := range redactKeys {
+		if q.Has(key) {
+			q.Set(key, "******")
+		}
+	}
+
+	u.RawQuery = q.Encode()
+	u.Fragment = ""
+
+	return u.String()
 }
