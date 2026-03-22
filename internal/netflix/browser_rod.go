@@ -60,7 +60,7 @@ func (rb *RodBrowser) OpenUpdatePrimaryLocation(link, traceID string) (models.Br
 type pageOutcome int
 
 const (
-	outcomeUnknown   pageOutcome = iota
+	outcomeUnknown pageOutcome = iota
 	outcomeConfirmed
 	outcomeExpired
 )
@@ -149,16 +149,16 @@ func racePageElements(page *rod.Page, timeout time.Duration) (pageOutcome, error
 
 	_, err := page.Timeout(timeout).Race().
 		Element(`[data-uia="set-primary-location-action"]`).Handle(func(e *rod.Element) error {
-			if err := e.Click(proto.InputMouseButtonLeft, 1); err != nil {
-				return err
-			}
-			outcome = outcomeConfirmed
-			return nil
-		}).
+		if err := e.Click(proto.InputMouseButtonLeft, 1); err != nil {
+			return err
+		}
+		outcome = outcomeConfirmed
+		return nil
+	}).
 		Element(`[data-uia="upl-invalid-token"]`).Handle(func(e *rod.Element) error {
-			outcome = outcomeExpired
-			return nil
-		}).
+		outcome = outcomeExpired
+		return nil
+	}).
 		Do()
 
 	return outcome, err
